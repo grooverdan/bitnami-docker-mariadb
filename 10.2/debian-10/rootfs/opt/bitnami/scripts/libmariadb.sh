@@ -25,6 +25,7 @@
 mysql_extra_flags() {
     local randNumber
     local -a dbExtraFlags=()
+    # shellcheck disable=SC2153
     read -r -a userExtraFlags <<< "$DB_EXTRA_FLAGS"
 
     if [[ -n "$DB_REPLICATION_MODE" ]]; then
@@ -70,9 +71,6 @@ mysql_validate() {
     empty_password_error() {
         print_validation_error "The $1 environment variable is empty or not set. Set the environment variable ALLOW_EMPTY_PASSWORD=yes to allow the container to be started with blank passwords. This is recommended only for development."
     }
-    backslash_password_error() {
-        print_validation_error "The password cannot contain backslashes ('\'). Set the environment variable $1 with no backslashes (more info at https://dev.mysql.com/doc/refman/8.0/en/string-comparison-functions.html)"
-    }
 
     if [[ -n "$DB_REPLICATION_MODE" ]]; then
         if [[ "$DB_REPLICATION_MODE" = "master" ]]; then
@@ -110,15 +108,6 @@ mysql_validate() {
                 empty_password_error "$(get_env_var PASSWORD)"
             fi
         fi
-    fi
-    if [[ "${DB_ROOT_PASSWORD:-}" = *\\* ]]; then
-        backslash_password_error "$(get_env_var ROOT_PASSWORD)"
-    fi
-    if [[ "${DB_PASSWORD:-}" = *\\* ]]; then
-        backslash_password_error "$(get_env_var PASSWORD)"
-    fi
-    if [[ "${DB_REPLICATION_PASSWORD:-}" = *\\* ]]; then
-        backslash_password_error "$(get_env_var REPLICATION_PASSWORD)"
     fi
 
     collation_env_var="$(get_env_var COLLATION)"
@@ -190,11 +179,14 @@ mysql_configure_replication() {
         done
         debug "Replication master ready!"
         debug "Setting the master configuration"
-        mysql_execute "mysql" <<EOF
+        local -r db_repl_password=$(mysql_sql_escape_string_literal "$DB_REPLICATION_PASSWORD")
+        mysql_execute "mysql" --binary-mode <<EOF
+-- we need the SQL_MODE NO_BACKSLASH_ESCAPES mode to be clear for the password to be set
+SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
 CHANGE MASTER TO MASTER_HOST='$DB_MASTER_HOST',
 MASTER_PORT=$DB_MASTER_PORT_NUMBER,
 MASTER_USER='$DB_REPLICATION_USER',
-MASTER_PASSWORD='$DB_REPLICATION_PASSWORD',
+MASTER_PASSWORD='$db_repl_password',
 MASTER_CONNECT_RETRY=10;
 EOF
     elif [[ "$DB_REPLICATION_MODE" = "master" ]]; then
@@ -217,21 +209,25 @@ EOF
 #########################
 mysql_ensure_replication_user_exists() {
     local -r user="${1:?user is required}"
-    local -r password="${2:-}"
+    local -r password=$(mysql_sql_escape_string_literal "${2:-}")
 
     debug "Configure replication user credentials"
     if [[ "$DB_FLAVOR" = "mariadb" ]]; then
-        mysql_execute "mysql" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" <<EOF
-create or replace user '$user'@'%' $([ "$password" != "" ] && echo "identified by \"$password\"");
+        # shellcheck disable=SC2016
+        mysql_execute "mysql" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" --binary-mode <<EOF
+-- we need the SQL_MODE NO_BACKSLASH_ESCAPES mode to be clear for the password to be set
+SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
+create or replace user '$user'@'%' ${password:+identified by '${password}'};
 EOF
     else
-        mysql_execute "mysql" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" <<EOF
-create user '$user'@'%' $([ "$password" != "" ] && echo "identified with 'mysql_native_password' by \"$password\"");
+        # shellcheck disable=SC2016
+        mysql_execute "mysql" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" --binary-mode <<EOF
+SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
+create user '$user'@'%' ${password:+identified with 'mysql_native_password' by '${password}'};
 EOF
     fi
     mysql_execute "mysql" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" <<EOF
 grant REPLICATION SLAVE on *.* to '$user'@'%' with grant option;
-flush privileges;
 EOF
 }
 
@@ -506,14 +502,13 @@ mysql_execute_print_output() {
         args+=("--defaults-file=${DB_CONF_FILE}")
     fi
     args+=("-N" "-u" "$user" "$db")
-    [[ -n "$pass" ]] && args+=("-p$pass")
     [[ "${#opts[@]}" -gt 0 ]] && args+=("${opts[@]}")
     [[ "${#extra_opts[@]}" -gt 0 ]] && args+=("${extra_opts[@]}")
 
     # Obtain the command specified via stdin
     local mysql_cmd
     mysql_cmd="$(</dev/stdin)"
-    debug "Executing SQL command:\n$mysql_cmd"
+    MYSQL_PWD="${pass}" debug "Executing SQL command:\n$mysql_cmd"
     "$DB_BIN_DIR/mysql" "${args[@]}" <<<"$mysql_cmd"
 }
 
@@ -746,8 +741,7 @@ mysql_upgrade() {
         mysql_stop
         mysql_start_bg "--upgrade=FORCE"
     else
-        mysql_start_bg
-        is_boolean_yes "${ROOT_AUTH_ENABLED:-false}" && args+=("-p$(get_master_env_var_value ROOT_PASSWORD)")
+        mysql_start_bg --skip-grant-tables
         debug_execute "${DB_BIN_DIR}/mysql_upgrade" "${args[@]}"
     fi
 }
@@ -777,6 +771,20 @@ mysql_migrate_old_configuration() {
     else
         warn "Old custom configuration migrated, please manually remove the 'conf' directory from the volume use to persist data"
     fi
+}
+
+########################
+# SQL escape the string to be placed in a string literal.
+# escape, \ followed by '
+# Arguments:
+#   $1 - password
+# Returns:
+#   Escaped password (via stdout)
+mysql_sql_escape_string_literal() {
+	local newline=$'\n'
+	local escaped=${1//\\/\\\\}
+	escaped="${escaped//$newline/\\n}"
+	echo "${escaped//\'/\\\'}"
 }
 
 ########################
@@ -839,10 +847,11 @@ mysql_ensure_user_exists() {
     if is_boolean_yes "$use_ldap"; then
         auth_string="identified via pam using '$DB_FLAVOR'"
     elif [[ -n "$password" ]]; then
+        password=$(mysql_sql_escape_string_literal "$password")
         if [[ -n "$auth_plugin" ]]; then
-            auth_string="identified with $auth_plugin by \"$password\""
+            auth_string="identified with $auth_plugin by '$password'"
         else
-            auth_string="identified by \"$password\""
+            auth_string="identified by '$password'"
         fi
     fi
     debug "creating database user \'$user\'"
@@ -856,7 +865,9 @@ mysql_ensure_user_exists() {
 
     local mysql_create_user_cmd
     [[ "$DB_FLAVOR" = "mariadb" ]] && mysql_create_user_cmd="create or replace user" || mysql_create_user_cmd="create user if not exists"
-    "${mysql_execute_cmd[@]}" "mysql" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" <<EOF
+    "${mysql_execute_cmd[@]}" "mysql" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" --binary-mode <<EOF
+-- we need the SQL_MODE NO_BACKSLASH_ESCAPES mode to be clear for the password to be set
+SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
 ${mysql_create_user_cmd} '${user}'@'%' ${auth_string};
 EOF
     debug "Removing all other hosts for the user"
@@ -914,9 +925,9 @@ EOF
 mysql_ensure_root_user_exists() {
     local -r user="${1:?user is required}"
     local -r password="${2:-}"
+    local -r epassword=$(mysql_sql_escape_string_literal "${password}")
     local -r auth_plugin="${3:-}"
     local auth_plugin_str=""
-    local alter_view_str=""
 
     if [[ -n "$auth_plugin" ]]; then
         auth_plugin_str="with $auth_plugin"
@@ -924,33 +935,24 @@ mysql_ensure_root_user_exists() {
 
     debug "Configuring root user credentials"
     if [[ "$DB_FLAVOR" = "mariadb" ]]; then
-        mysql_execute "mysql" "root" <<EOF
+        # shellcheck disable=SC2016
+        mysql_execute "mysql" "root" --binary-mode <<EOF
 -- create root@localhost user for local admin access
--- create user 'root'@'localhost' $([ "$password" != "" ] && echo "identified by \"$password\"");
+-- create user 'root'@'localhost' ${epassword:+identified by '${epassword}'};
 -- grant all on *.* to 'root'@'localhost' with grant option;
 -- create admin user for remote access
-create user '$user'@'%' $([ "$password" != "" ] && echo "identified $auth_plugin_str by \"$password\"");
+-- we need the SQL_MODE NO_BACKSLASH_ESCAPES mode to be clear for the password to be set
+SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
+create user '$user'@'%' ${password:+identified ${auth_plugin_str} by '${epassword}'};
 grant all on *.* to '$user'@'%' with grant option;
-flush privileges;
 EOF
-        # Since MariaDB >=10.4, the mysql.user table was replaced with a view: https://mariadb.com/kb/en/mysqluser-table/
-        # Views have a definer user, in this case set to 'root', which needs to exist for the view to work
-        # In MySQL, to avoid issues when renaming the root user, they use the 'mysql.sys' user as a definer: https://dev.mysql.com/doc/refman/5.7/en/sys-schema.html
-        # However, for MariaDB that is not the case, so when the 'root' user is renamed the 'mysql.user' table stops working and the view needs to be fixed
-        if [[ "$user" != "root" && ! "$(mysql_get_version)" =~ ^10.[0123]. ]]; then
-            alter_view_str="$(mysql_execute_print_output "mysql" "$user" "$password" "-s" <<EOF
--- create per-view string for altering its definer
-select concat("alter definer='$user'@'%' VIEW ", table_name, " AS ", view_definition, ";") FROM information_schema.views WHERE table_schema='mysql';
-EOF
-)"
-            mysql_execute "mysql" "$user" "$password" <<<"$alter_view_str; flush privileges;"
-        fi
     else
-        mysql_execute "mysql" "root" <<EOF
+        # shellcheck disable=SC2016
+        mysql_execute "mysql" "root" --binary-mode <<EOF
 -- create admin user
-create user '$user'@'%' $([ "$password" != "" ] && echo "identified by \"$password\"");
+SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
+create user '$user'@'%' ${epassword:+identified by '${epassword}'};
 grant all on *.* to '$user'@'%' with grant option;
-flush privileges;
 EOF
     fi
 }
@@ -1272,14 +1274,10 @@ find_jemalloc_lib() {
 #########################
 mysql_healthcheck() {
     local args=("-uroot" "-h0.0.0.0")
-    local root_password
+    local -r pass="$(get_master_env_var_value ROOT_PASSWORD)"
 
-    root_password="$(get_master_env_var_value ROOT_PASSWORD)"
-    if [[ -n "$root_password" ]]; then
-        args+=("-p${root_password}")
-    fi
-
-    mysqladmin "${args[@]}" ping && mysqladmin "${args[@]}" status
+    MYSQL_PWD="${pass}" mysqladmin "${args[@]}" ping && \
+        MYSQL_PWD="${pass}" mysqladmin "${args[@]}" status
 }
 
 ########################
