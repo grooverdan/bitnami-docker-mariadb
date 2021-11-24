@@ -508,8 +508,8 @@ mysql_execute_print_output() {
     # Obtain the command specified via stdin
     local mysql_cmd
     mysql_cmd="$(</dev/stdin)"
-    MYSQL_PWD="${pass}" debug "Executing SQL command:\n$mysql_cmd"
-    "$DB_BIN_DIR/mysql" "${args[@]}" <<<"$mysql_cmd"
+    debug "Executing SQL command:\n$mysql_cmd"
+    MYSQL_PWD="${pass}" "$DB_BIN_DIR/mysql" "${args[@]}" <<<"$mysql_cmd"
 }
 
 ########################
