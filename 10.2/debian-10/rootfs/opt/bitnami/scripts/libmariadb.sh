@@ -936,7 +936,7 @@ mysql_ensure_root_user_exists() {
     debug "Configuring root user credentials"
     if [[ "$DB_FLAVOR" = "mariadb" ]]; then
         # shellcheck disable=SC2016
-        mysql_execute "mysql" "root" --binary-mode <<EOF
+        mysql_execute "mysql" "root" "" "--binary-mode" <<EOF
 -- create root@localhost user for local admin access
 -- create user 'root'@'localhost' ${epassword:+identified by '${epassword}'};
 -- grant all on *.* to 'root'@'localhost' with grant option;
