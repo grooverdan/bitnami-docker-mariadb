@@ -180,7 +180,11 @@ mysql_configure_replication() {
         debug "Replication master ready!"
         debug "Setting the master configuration"
         local -r db_repl_password=$(mysql_sql_escape_string_literal "$DB_REPLICATION_PASSWORD")
-        mysql_execute "mysql" --binary-mode <<EOF
+	# The flush privileges in the slave mode is necessary. The other flush is done for master
+	# and non-replication configurations in mysql_ensure_root_user_exists
+        mysql_execute "mysql" "root" "" --binary-mode <<EOF
+-- Flush the previous clearing of privs with DELETE
+FLUSH PRIVILEGES;
 -- we need the SQL_MODE NO_BACKSLASH_ESCAPES mode to be clear for the password to be set
 SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
 CHANGE MASTER TO MASTER_HOST='$DB_MASTER_HOST',
@@ -312,7 +316,8 @@ EOF
             [[ -n "$DB_ROOT_PASSWORD" ]] && export ROOT_AUTH_ENABLED="yes"
         fi
         [[ -n "$DB_REPLICATION_MODE" ]] && mysql_configure_replication
-        # we run mysql_upgrade in order to recreate necessary database users and flush privileges
+        # we run mysql_upgrade in order to update system tables to support newer features and mariadb.sys
+	# ownership of mysql.users view.
         mysql_upgrade
     fi
 }
@@ -741,8 +746,8 @@ mysql_upgrade() {
         mysql_stop
         mysql_start_bg "--upgrade=FORCE"
     else
-        mysql_start_bg --skip-grant-tables
-        debug_execute "${DB_BIN_DIR}/mysql_upgrade" "${args[@]}"
+        mysql_start_bg
+        MYSQL_PWD="$DB_ROOT_PASSWORD" debug_execute "${DB_BIN_DIR}/mysql_upgrade" "${args[@]}"
     fi
 }
 
@@ -936,20 +941,20 @@ mysql_ensure_root_user_exists() {
     debug "Configuring root user credentials"
     if [[ "$DB_FLAVOR" = "mariadb" ]]; then
         # shellcheck disable=SC2016
-        mysql_execute "mysql" "root" --binary-mode <<EOF
--- create root@localhost user for local admin access
--- create user 'root'@'localhost' ${epassword:+identified by '${epassword}'};
--- grant all on *.* to 'root'@'localhost' with grant option;
--- create admin user for remote access
+        mysql_execute "mysql" "root" "" "--binary-mode" <<EOF
+-- last use of password root user previously removed.
+FLUSH PRIVILEGES;
 -- we need the SQL_MODE NO_BACKSLASH_ESCAPES mode to be clear for the password to be set
 SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
+-- create admin user for remote access
 create user '$user'@'%' ${password:+identified ${auth_plugin_str} by '${epassword}'};
 grant all on *.* to '$user'@'%' with grant option;
 EOF
     else
         # shellcheck disable=SC2016
-        mysql_execute "mysql" "root" --binary-mode <<EOF
+        mysql_execute "mysql" "root" "" --binary-mode <<EOF
 -- create admin user
+FLUSH PRIVILEGES;
 SET @@SESSION.SQL_MODE=REPLACE(@@SESSION.SQL_MODE, 'NO_BACKSLASH_ESCAPES', '');
 create user '$user'@'%' ${epassword:+identified by '${epassword}'};
 grant all on *.* to '$user'@'%' with grant option;
